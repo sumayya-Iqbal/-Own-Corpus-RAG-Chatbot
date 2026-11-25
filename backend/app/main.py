@@ -1,10 +1,13 @@
 
 import logging
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.dependencies import get_db
+from app.db.models import Document, DocumentChunk
 from app.ingestion.service import upload_document
 from app.schemas.search import SearchRequest
 from app.schemas.answer import AnswerRequest
@@ -44,7 +47,81 @@ async def upload_file(
     return await upload_document(file, db)
 
 
-# FEATURE 2: Search document chunks using semantic similarity.
+# FEATURE 2: Get details about one uploaded document.
+@app.get("/api/documents/{document_id}", tags=["Documents"])
+def get_document(
+    document_id: UUID,
+    db: Session = Depends(get_db),
+):
+    # Step 1: Find the document using its UUID.
+    document = db.get(Document, document_id)
+
+    # Step 2: Return 404 if the document does not exist.
+    if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    # Step 3: Count its chunks directly in the database.
+    # This avoids loading every chunk and embedding into memory.
+    chunks_count = db.scalar(
+        select(func.count(DocumentChunk.id)).where(
+            DocumentChunk.document_id == document_id
+        )
+    )
+
+    # Step 4: Return useful document information.
+    return {
+        "id": str(document.id),
+        "filename": document.filename,
+        "status": document.status,
+        "created_at": document.created_at,
+        "chunks_count": chunks_count,
+    }
+
+
+# FEATURE 3: Delete a document and its associated chunks.
+@app.delete("/api/documents/{document_id}", tags=["Documents"])
+def delete_document(
+    document_id: UUID,
+    db: Session = Depends(get_db),
+):
+    # Step 1: Check whether the document exists.
+    document = db.get(Document, document_id)
+
+    if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    try:
+        # Step 2: Delete the document.
+        # The SQLAlchemy relationship cascade deletes its chunks too.
+        db.delete(document)
+
+        # Step 3: Save the deletion in the database.
+        db.commit()
+
+        return {
+            "message": "Document and its associated chunks deleted successfully.",
+            "document_id": str(document_id),
+        }
+
+    except Exception:
+        # Undo the transaction if deletion fails.
+        db.rollback()
+
+        logger.exception("Document deletion failed")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Document deletion failed. Please try again.",
+        )
+
+
+# FEATURE 4: Search document chunks using semantic similarity.
 @app.post("/api/search", tags=["Retrieval"])
 def search_documents(
     request: SearchRequest,
@@ -63,7 +140,7 @@ def search_documents(
     }
 
 
-# FEATURE 3: Retrieve document chunks and generate an answer with Gemini.
+# FEATURE 5: Retrieve document chunks and generate an answer with Gemini.
 @app.post("/api/ask", tags=["Generation"])
 def ask_documents(
     request: AnswerRequest,
